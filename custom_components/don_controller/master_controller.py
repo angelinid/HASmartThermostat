@@ -35,7 +35,7 @@ Orchestrates heating across multiple zones (rooms) using a PID controller:
 
 import logging
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 try:
     from .zone_wrapper import ZoneWrapper
@@ -87,6 +87,11 @@ class MasterController:
                 - entity_id: Climate entity ID in Home Assistant
                 - name: Human-readable zone name
                 - area: Floor area in m² (optional)
+                - priority: Zone priority weight 0.0-1.0 (optional, default 1.0)
+                  * 1.0 = normal importance, full demand counted
+                  * 0.5 = medium importance, half demand
+                  * 0.1 = low importance, aggregated to prevent cycling
+                - trv_entity_id: TRV valve opening % entity for mitigation (optional)
         """
         self.hass = hass
         self.zones: dict[str, ZoneWrapper] = {}
@@ -98,20 +103,31 @@ class MasterController:
             entity_id = config['entity_id']
             zone_name = config.get('name', entity_id)
             area = config.get('area', 0.0)
+            priority = config.get('priority', 1.0)  # Default: normal priority
+            trv_entity_id = config.get('trv_entity_id', None)  # Optional TRV tracking
             
-            # Create zone wrapper with PID controller
+            # Create zone wrapper with PID controller and priority
             self.zones[entity_id] = ZoneWrapper(
                 entity_id=entity_id, 
                 name=zone_name,
-                floor_area_m2=area
+                floor_area_m2=area,
+                priority=priority,
+                trv_entity_id=trv_entity_id
             )
             _LOGGER.info(
-                "MasterController: Registered zone '%s' (%s, area=%.1f m²)", 
-                zone_name, entity_id, area
+                "MasterController: Registered zone '%s' (%s, area=%.1f m², priority=%.2f%s)", 
+                zone_name, entity_id, area, priority,
+                f", TRV tracking" if trv_entity_id else ""
             )
         
         # List of all entities to monitor for Home Assistant state change events
+        # This includes both climate entities and optional TRV entities
         self.monitored_entity_ids = list(self.zones.keys())
+        
+        # Add TRV entities to monitoring list
+        for zone in self.zones.values():
+            if zone.trv_entity_id:
+                self.monitored_entity_ids.append(zone.trv_entity_id)
 
     async def async_start_listening(self):
         """
@@ -131,10 +147,13 @@ class MasterController:
         
     async def _async_hvac_demand_change(self, event) -> None:
         """
-        Event handler: Called when any monitored zone's climate state changes.
+        Event handler: Called when any monitored entity's state changes.
         
-        Updates the zone's temperature, target, and HVAC action from Home Assistant state,
-        then triggers the core control logic to recalculate boiler demand.
+        Handles both climate entity changes and TRV valve opening updates:
+        - Climate entity change: Updates temperature, target, HVAC action
+        - TRV opening change: Updates valve opening % for demand mitigation
+        
+        After any state change, triggers boiler control logic recalculation.
         
         Args:
             event: Home Assistant state change event containing entity_id and new_state
@@ -144,53 +163,126 @@ class MasterController:
         
         _LOGGER.debug("State change event received for entity_id=%s", entity_id)
         
-        # Update zone from new Home Assistant state
+        # Check if this is a climate entity update or TRV update
         zone = self.zones.get(entity_id)
         if zone and new_state:
+            # Climate entity update
             zone.update_from_state(new_state)
             _LOGGER.debug("Zone '%s' updated from state", zone.name)
-        elif not zone:
-            _LOGGER.warning("Unknown entity_id received: %s", entity_id)
+        else:
+            # Check if this is a TRV entity update for any zone
+            trv_updated = False
+            for zone in self.zones.values():
+                if zone.trv_entity_id == entity_id and new_state:
+                    try:
+                        # Extract TRV opening percentage from state
+                        trv_opening = float(new_state.state)
+                        zone.update_trv_opening(trv_opening)
+                        trv_updated = True
+                        _LOGGER.debug(
+                            "Zone '%s': TRV opening updated to %.0f%%",
+                            zone.name, trv_opening
+                        )
+                    except (ValueError, TypeError) as e:
+                        _LOGGER.warning(
+                            "Error reading TRV opening from %s: %s",
+                            entity_id, e
+                        )
+                    break
+            
+            if not zone and not trv_updated:
+                _LOGGER.warning("Unknown entity_id received: %s", entity_id)
             
         # Recalculate boiler command based on all zones' current states
         await self._calculate_and_command()
 
     async def _calculate_and_command(self) -> None:
         """
-        Core control algorithm: Find max demand zone and command boiler.
+        Core control algorithm: Find max demand zone with priority aggregation.
         
         Algorithm:
-        1. Iterate through all zones and find the one with maximum positive temperature error
-        2. Use that zone's PID controller to calculate required boiler output
-        3. Map PID output to OpenTherm flow temperature (higher error -> higher temperature)
-        4. Command the boiler via Home Assistant service call
+        1. Separate zones by priority level (high vs low priority)
+        2. For HIGH priority zones: any one can trigger boiler
+        3. For LOW priority zones: require at least 2 demanding to trigger boiler (prevent cycling)
+        4. Find zone with maximum demand among eligible zones
+        5. Use that zone's PID controller to calculate required boiler output
+        6. Map PID output to OpenTherm flow temperature
+        7. Command the boiler via Home Assistant service call
         
-        Energy optimization:
-        - Only the max-demand zone drives boiler command (saves energy)
-        - Other zones still benefit from the heated system
-        - As max zone satisfies, next highest zone takes priority
+        Priority Aggregation:
+        - High priority (priority > 0.5): Single zone can trigger boiler
+        - Low priority (priority <= 0.5): At least 2 zones must demand heat to trigger
+        - This prevents low-importance rooms (e.g., guest room, garage) from unnecessarily
+          turning on the boiler when only one zone needs heat
+        - Balances comfort with energy efficiency
+        
+        TRV Mitigation:
+        - Error boosted when valve is closing (lower opening % = higher boost)
+        - Compensates for TRV restricting flow as it approaches setpoint
         """
         
-        # Step 1: Find the zone with maximum demand (largest positive error)
-        max_demand_zone = None
-        max_error = 0.0
-        time_delta = 0.0
+        # Step 1: Collect zones by priority level
+        high_priority_zones = []
+        low_priority_zones = []
         
-        # Log all zone statuses for debugging/monitoring
+        for zone in self.zones.values():
+            if zone.is_demanding_heat:
+                if zone.priority > 0.5:
+                    high_priority_zones.append(zone)
+                else:
+                    low_priority_zones.append(zone)
+        
+        # Log zone grouping for monitoring
+        _LOGGER.debug(
+            "Priority aggregation: %d high-priority demanding, %d low-priority demanding",
+            len(high_priority_zones), len(low_priority_zones)
+        )
+        
+        # Log detailed status of all zones
         for zone in self.zones.values():
             demand_metric = zone.get_demand_metric()
+            priority_group = "high" if zone.priority > 0.5 else "low"
             _LOGGER.debug(
-                "Zone '%s': demanding=%s, current_error=%.1f°C, demand_metric=%.1f°C",
-                zone.name, zone.is_demanding_heat, zone.current_error, demand_metric
+                "Zone '%s': [%s-priority] demanding=%s, error=%.1f°C, priority=%.2f, demand_metric=%.2f°C%s",
+                zone.name, priority_group, zone.is_demanding_heat, zone.current_error, 
+                zone.priority, demand_metric,
+                f", TRV={zone.trv_opening_percent:.0f}%" if zone.trv_entity_id else ""
             )
-            
-            # Track zone with highest demand (error) that is actively heating
-            if zone.is_demanding_heat and zone.current_error > max_error:
-                max_error = zone.current_error
+        
+        # Step 2: Determine if boiler should be activated
+        # HIGH priority: any single zone demanding heat can trigger
+        # LOW priority: require at least 2 zones demanding to prevent cycling
+        boiler_demand_eligible = []
+        
+        # Add all high-priority demanding zones
+        boiler_demand_eligible.extend(high_priority_zones)
+        
+        # Add low-priority zones only if at least 2 are demanding
+        if len(low_priority_zones) >= 2:
+            boiler_demand_eligible.extend(low_priority_zones)
+            _LOGGER.debug(
+                "Low-priority aggregation: %d zones demanding, threshold met (≥2), including in boiler decision",
+                len(low_priority_zones)
+            )
+        elif len(low_priority_zones) == 1:
+            _LOGGER.debug(
+                "Low-priority aggregation: %d zone demanding, threshold NOT met (<2), excluding from boiler decision",
+                len(low_priority_zones)
+            )
+        
+        # Step 3: Find the zone with maximum demand among eligible zones
+        max_demand_zone = None
+        max_demand = 0.0
+        time_delta = 0.0
+        
+        for zone in boiler_demand_eligible:
+            demand_metric = zone.get_demand_metric()
+            if demand_metric > max_demand:
+                max_demand = demand_metric
                 max_demand_zone = zone
                 time_delta = time.time() - zone.last_update_time if zone.last_update_time else 0.0
 
-        # Step 2: Command boiler based on max demand zone
+        # Step 4: Command boiler based on max demand zone
         if max_demand_zone:
             # Calculate PID output from max demand zone's error
             pid_output = max_demand_zone.calculate_pid_output(time_delta)
@@ -201,14 +293,29 @@ class MasterController:
             required_flow_temp = max(MIN_FLOW_TEMP, min(MAX_FLOW_TEMP, 40.0 + pid_output))
             
             await self.async_set_opentherm_flow_temp(required_flow_temp)
+            
+            # Determine boiler trigger reason (high-priority vs low-priority aggregation)
+            trigger_reason = "high-priority demand"
+            if max_demand_zone in low_priority_zones:
+                trigger_reason = f"low-priority aggregation ({len(low_priority_zones)} zones)"
+            
             _LOGGER.info(
-                "Boiler ON. Max demand from zone '%s': error=%.1f°C, PID=%.2f, flow_temp=%.1f°C",
-                max_demand_zone.name, max_error, pid_output, required_flow_temp
+                "Boiler ON [%s]. Max demand from zone '%s': error=%.1f°C, priority=%.2f, "
+                "demand=%.2f°C, PID=%.2f, flow_temp=%.1f°C",
+                trigger_reason, max_demand_zone.name, max_demand_zone.current_error, 
+                max_demand_zone.priority, max_demand, pid_output, required_flow_temp
             )
         else:
-            # No zone demanding heat: turn boiler OFF
+            # No eligible zones demanding heat: turn boiler OFF
             await self.async_set_opentherm_flow_temp(MIN_FLOW_TEMP)
-            _LOGGER.info("Boiler OFF. All zones satisfied.")
+            
+            if len(low_priority_zones) > 0:
+                _LOGGER.info(
+                    "Boiler OFF. No high-priority zones demanding. Low-priority zones: %d demanding (need ≥2)",
+                    len(low_priority_zones)
+                )
+            else:
+                _LOGGER.info("Boiler OFF. All zones satisfied.")
 
     async def async_set_opentherm_flow_temp(self, flow_temp: float) -> None:
         """
@@ -236,3 +343,44 @@ class MasterController:
             {"entity_id": OPEN_THERM_FLOW_TEMP_ENTITY, "value": final_temp},
             blocking=False,
         )
+
+    def get_controller_state(self) -> dict:
+        """
+        Export complete controller state for Home Assistant monitoring.
+        
+        Returns controller-wide metrics and per-zone PID information that can be
+        displayed in Home Assistant UI or used for automations.
+        
+        Returns:
+            dict: Controller state with zones array containing PID data for each zone
+        """
+        zones_state = []
+        for zone in self.zones.values():
+            zones_state.append({
+                "name": zone.name,
+                "entity_id": zone.entity_id,
+                "state": zone.export_pid_state()
+            })
+        
+        return {
+            "zones": zones_state,
+            "zone_count": len(self.zones)
+        }
+    
+    def get_zone_state(self, entity_id: str) -> Optional[dict]:
+        """
+        Export state for a specific zone.
+        
+        Useful for creating Home Assistant template sensors that display
+        PID components, priority, TRV opening %, etc.
+        
+        Args:
+            entity_id: Climate entity ID of the zone
+            
+        Returns:
+            dict: Zone's PID state, or None if zone not found
+        """
+        zone = self.zones.get(entity_id)
+        if zone:
+            return zone.export_pid_state()
+        return None

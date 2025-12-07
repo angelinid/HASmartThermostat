@@ -1,47 +1,33 @@
-# tests/test_master_controller.py
 import unittest
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 import sys
 import os
-import logging
 
 # --- PATH ADJUSTMENT ---
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-# --- Import Mocks and Custom Classes ---
-from unit_tests.mocks import MockHASS, FIXED_TIME_START, create_mock_event
+# --- Import from unified test helpers ---
+from test_helpers import UnifiedTestFixture, MockHASS, create_mock_event
 from zone_wrapper import KP
 from master_controller import MasterController, MIN_FLOW_TEMP, MAX_FLOW_TEMP, OPEN_THERM_FLOW_TEMP_ENTITY
-from logging_util import LogCollector, setup_logging
 
 
 # =========================================================
-# TEST FIXTURE BASE
+# TEST FIXTURE - Use unified base
 # =========================================================
 
-class BaseTestFixture(unittest.TestCase):
+class BaseTestFixture(UnifiedTestFixture):
+    """Extended base class with master controller-specific setup."""
     
     def setUp(self):
-        # Time patcher for time-based tests
-        self.time_patcher = patch('time.time', return_value=FIXED_TIME_START)
-        self.mock_time = self.time_patcher.start()
+        super().setUp()
         
         self.zone_configs = [
             {"entity_id": "climate.test_bedroom", "name": "Bedroom", "area": 10.0},
             {"entity_id": "climate.test_kitchen", "name": "Kitchen", "area": 15.0},
         ]
         self.mock_hass = MockHASS()
-        
-        # Setup logging collection
-        setup_logging(level=logging.DEBUG)
-        self.log_collector = LogCollector()
-        self.log_collector.start_collecting()
-
-    def tearDown(self):
-        self.time_patcher.stop()
-        self.log_collector.stop_collecting()
-
 
 # =========================================================
 # MASTER CONTROLLER TEST SUITE

@@ -34,41 +34,36 @@ Tests fundamental PID control logic with simple 2-zone setup:
 
 import unittest
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 import sys
 import os
-import logging
 
 # --- PATH ADJUSTMENT ---
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # --- IMPORTS ---
-from unit_tests.mocks import MockHASS, FIXED_TIME_START, create_mock_event
+from test_helpers import UnifiedTestFixture, MockHASS, create_mock_event
 from zone_wrapper import KP
 from master_controller import MasterController, MIN_FLOW_TEMP, MAX_FLOW_TEMP, OPEN_THERM_FLOW_TEMP_ENTITY
-from logging_util import LogCollector, setup_logging
 
 
 # =========================================================
-# TEST FIXTURE BASE - Common Setup for All Tests
+# TEST FIXTURE BASE - Use unified base
 # =========================================================
 
-class BaseTestFixture(unittest.TestCase):
+class BaseTestFixture(UnifiedTestFixture):
     """
-    Base test class that provides common setup/teardown for all tests.
+    Extended base class with master controller-specific setup.
     
     Provides:
-    - Time mocking for deterministic time-based tests
     - Standard 2-zone configuration (Bedroom, Kitchen)
     - Mock Home Assistant instance
-    - Logging collection for debugging
+    - All base logging and time mocking from UnifiedTestFixture
     """
     
     def setUp(self):
         """Initialize test environment with time mocking and mock HASS instance."""
-        # Mock time.time() to return consistent values across tests
-        self.time_patcher = patch('time.time', return_value=FIXED_TIME_START)
-        self.mock_time = self.time_patcher.start()
+        super().setUp()
         
         # Standard 2-zone configuration for basic tests
         self.zone_configs = [
@@ -76,16 +71,6 @@ class BaseTestFixture(unittest.TestCase):
             {"entity_id": "climate.test_kitchen", "name": "Kitchen", "area": 15.0},
         ]
         self.mock_hass = MockHASS()
-        
-        # Setup logging to capture controller behavior
-        setup_logging(level=logging.DEBUG)
-        self.log_collector = LogCollector()
-        self.log_collector.start_collecting()
-
-    def tearDown(self):
-        """Clean up test environment."""
-        self.time_patcher.stop()
-        self.log_collector.stop_collecting()
 
 
 # =========================================================

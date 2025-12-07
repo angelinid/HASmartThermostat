@@ -1,39 +1,46 @@
 # tests/test_zone_wrapper.py
+"""
+Test Suite for ZoneWrapper - Individual Zone PID Control
+
+This test suite validates:
+1. Basic zone functionality (temperature error, demand status)
+2. PID controller behavior (proportional, integral, derivative terms)
+3. Priority levels (high vs low priority zones)
+4. TRV valve mitigation (error boosting when valve opens less)
+5. Real-world scenarios (sunny day, rainy day, user setpoint changes)
+
+Test Organization:
+- BaseTestFixture: Common setup/teardown for all tests
+- TestZoneWrapper: Core functionality tests
+- TestZonePriority: Priority level handling (high/low)
+- TestZoneTRVMitigation: TRV valve opening percentage impact
+- TestZoneSunnyDay: Sunny day scenarios with solar gain
+- TestZoneRainyDay: Rainy day scenarios with sustained demand
+- TestZoneUserActions: User-initiated setpoint changes and heating cycles
+"""
+
 import unittest
-from unittest.mock import patch
 import sys
 import os
-import logging
 
 # --- PATH ADJUSTMENT ---
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-# --- Import Mocks and Custom Classes ---
-from unit_tests.mocks import MockState, FIXED_TIME_START
+# --- Import from unified test helpers ---
+from test_helpers import UnifiedTestFixture, MockState
 from zone_wrapper import ZoneWrapper, KP, KI, KD
-from logging_util import LogCollector, setup_logging
 
 
 # =========================================================
-# TEST FIXTURE BASE
+# TEST FIXTURE - Use unified base
 # =========================================================
 
-class BaseTestFixture(unittest.TestCase):
-    """Base class for shared setup logic."""
+class BaseTestFixture(UnifiedTestFixture):
+    """Extended base class with zone-specific setup."""
     
     def setUp(self):
-        self.time_patcher = patch('time.time', return_value=FIXED_TIME_START)
-        self.mock_time = self.time_patcher.start()
+        super().setUp()
         self.zone_config = {"entity_id": "climate.test_bedroom", "name": "Bedroom"}
-        
-        # Setup logging collection
-        setup_logging(level=logging.DEBUG)
-        self.log_collector = LogCollector()
-        self.log_collector.start_collecting()
-
-    def tearDown(self):
-        self.time_patcher.stop()
-        self.log_collector.stop_collecting()
 
 
 

@@ -44,38 +44,34 @@ Simulates realistic house thermal topology:
 
 import unittest
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 import sys
 import os
-import logging
 
 # --- PATH ADJUSTMENT ---
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # --- IMPORTS ---
-from unit_tests.mocks import MockHASS, FIXED_TIME_START, create_mock_event
+from test_helpers import UnifiedTestFixture, MockHASS, create_mock_event
 from zone_wrapper import KP
 from master_controller import MasterController, MIN_FLOW_TEMP, MAX_FLOW_TEMP, OPEN_THERM_FLOW_TEMP_ENTITY
-from logging_util import LogCollector, setup_logging
 
 
 # =========================================================
-# TEST FIXTURE BASE - 11-Zone Setup
+# TEST FIXTURE BASE - 11-Zone Setup (Use unified base)
 # =========================================================
 
-class BaseTestFixture(unittest.TestCase):
+class BaseTestFixture(UnifiedTestFixture):
     """
-    Base test class providing 11-zone house configuration.
+    Extended base class providing 11-zone house configuration.
     
     Configures realistic thermal topology simulating a multi-level house
     with various zone sizes and thermal coupling characteristics.
     """
     
     def setUp(self):
-        """Initialize 11-zone test environment with time mocking."""
-        # Mock time for deterministic tests
-        self.time_patcher = patch('time.time', return_value=FIXED_TIME_START)
-        self.mock_time = self.time_patcher.start()
+        """Initialize 11-zone test environment with unified base setup."""
+        super().setUp()
         
         # 11-zone house configuration with realistic floor areas
         self.zone_configs = [
@@ -92,16 +88,6 @@ class BaseTestFixture(unittest.TestCase):
             {"entity_id": "climate.laundry", "name": "Laundry", "area": 10.0},
         ]
         self.mock_hass = MockHASS()
-        
-        # Setup logging
-        setup_logging(level=logging.DEBUG)
-        self.log_collector = LogCollector()
-        self.log_collector.start_collecting()
-
-    def tearDown(self):
-        """Clean up test environment."""
-        self.time_patcher.stop()
-        self.log_collector.stop_collecting()
 
 
 # =========================================================
